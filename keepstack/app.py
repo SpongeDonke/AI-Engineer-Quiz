@@ -6,6 +6,7 @@ single-page web client is served from the ``web/`` directory at the root.
 """
 from __future__ import annotations
 
+import csv
 import io
 import ipaddress
 import json
@@ -178,16 +179,69 @@ def list_assets(
     q: str = "",
     media_type: Optional[str] = None,
     tag: Optional[str] = None,
+    include_tags: list[str] = Query(default=[]),
+    exclude_tags: list[str] = Query(default=[]),
     collection_id: Optional[int] = None,
     status: str = "active",
     sort: str = "newest",
     mode: str = "keyword",
-    limit: int = Query(60, le=200),
+    limit: int = search.DEFAULT_LIMIT,
     offset: int = 0,
     user: dict = Depends(require_user),
 ):
-    return search.search(q=q, media_type=media_type, tag=tag, collection_id=collection_id,
+    limit, offset = _window(limit, offset)
+    return search.search(q=q, media_type=media_type, tag=tag, include_tags=include_tags,
+                         exclude_tags=exclude_tags, collection_id=collection_id,
                          status=status, sort=sort, mode=mode, limit=limit, offset=offset)
+
+
+def _window(limit: int, offset: int) -> tuple[int, int]:
+    """Reject paging values the client cannot use, instead of silently
+    clamping them into a different page than the one asked for."""
+    if limit < 1 or limit > search.MAX_LIMIT:
+        raise HTTPException(400, f"limit must be between 1 and {search.MAX_LIMIT}")
+    if offset < 0:
+        raise HTTPException(400, "offset must be 0 or greater")
+    return limit, offset
+
+
+@app.get("/api/export/assets.csv")
+def export_assets(
+    request: Request,
+    q: str = "",
+    media_type: Optional[str] = None,
+    include_tags: list[str] = Query(default=[]),
+    exclude_tags: list[str] = Query(default=[]),
+    collection_id: Optional[int] = None,
+    sort: str = "newest",
+    user: dict = Depends(require_user),
+):
+    """CSV of the whole result set, in the same order the library shows it.
+
+    Tags are joined with a semicolon; everything else is written verbatim and
+    quoted by the csv module where needed.
+    """
+    rows = search.export_rows(q=q, media_type=media_type, include_tags=include_tags,
+                              exclude_tags=exclude_tags, collection_id=collection_id,
+                              sort=sort)
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")
+    writer.writerow(search.EXPORT_COLUMNS)
+    for row in rows:
+        writer.writerow([
+            row["uuid"], row["title"], row["description"], row["filename"],
+            row["media_type"], ";".join(row["tags"]), row["created_at"],
+        ])
+    log("asset.export", user=user, ip=client_ip(request), detail=f"{len(rows)} rows")
+    return Response(
+        # The BOM is what makes Excel read the file as UTF-8 instead of cp1252.
+        content="\ufeff" + buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="keepstack-assets.csv"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 def _get_asset_or_404(uuid: str) -> dict:
