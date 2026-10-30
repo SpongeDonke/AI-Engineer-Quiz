@@ -3,7 +3,7 @@
 Three complementary modes over one catalog:
 
   * keyword  - FTS5 full-text across title, description, tags, metadata
-  * filter   - faceted structured filters (media type, tag, status, dates)
+  * filter   - faceted structured filters (media type, tags, collection, status)
   * semantic - embedding cosine ranking ("natural language" / more-like-this)
 
 Facet counts are returned alongside results so the UI can render a live,
@@ -11,17 +11,26 @@ drill-down sidebar.
 """
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 from . import ai
 from .db import get_conn
 
+DEFAULT_LIMIT = 12
+MAX_LIMIT = 100
+
+# Every order ends with the primary key, so assets created in the same second
+# still sort deterministically and consecutive pages never overlap.
 SORTS = {
-    "newest": "a.created_at DESC",
-    "oldest": "a.created_at ASC",
-    "name": "a.title ASC",
-    "largest": "a.size DESC",
+    "newest": "a.created_at DESC, a.id DESC",
+    "oldest": "a.created_at ASC, a.id ASC",
+    "name": "a.title ASC, a.id ASC",
+    "largest": "a.size DESC, a.id ASC",
 }
+
+EXPORT_COLUMNS = ("uuid", "title", "description", "filename", "media_type", "tags", "created_at")
+_EXPORT_FIELDS = ("uuid", "title", "description", "filename", "media_type", "created_at")
 
 
 def _fts_query(q: str) -> str:
@@ -30,53 +39,93 @@ def _fts_query(q: str) -> str:
     return " ".join(f'"{t}"*' for t in terms)
 
 
+def _tag_names(tags) -> list[str]:
+    """Normalise tags the way the rest of the app stores them: lower case,
+    trimmed, no duplicates, blank entries dropped."""
+    out: list[str] = []
+    for raw in tags or ():
+        name = (raw or "").strip().lower()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def _where(
+    *,
+    q: str,
+    media_type: Optional[str],
+    include_tags: list[str],
+    exclude_tags: list[str],
+    collection_id: Optional[int],
+    status: str,
+) -> tuple[str, list]:
+    where = ["a.status = ?"]
+    params: list = [status]
+
+    match = _fts_query(q) if q and q.strip() else ""
+    if match:
+        where.append("a.id IN (SELECT rowid FROM asset_fts WHERE asset_fts MATCH ?)")
+        params.append(match)
+    if media_type:
+        where.append("a.media_type = ?")
+        params.append(media_type)
+    if collection_id:
+        where.append("EXISTS (SELECT 1 FROM collection_assets ca "
+                     "WHERE ca.asset_id = a.id AND ca.collection_id = ?)")
+        params.append(collection_id)
+
+    # EXISTS rather than a join: an asset with several matching tags stays one
+    # row, which keeps COUNT(*) and LIMIT/OFFSET honest.
+    for name in include_tags:
+        where.append("EXISTS (SELECT 1 FROM asset_tags at JOIN tags t ON t.id = at.tag_id "
+                     "WHERE at.asset_id = a.id AND t.name = ?)")
+        params.append(name)
+    if exclude_tags:
+        marks = ",".join("?" for _ in exclude_tags)
+        where.append("NOT EXISTS (SELECT 1 FROM asset_tags at JOIN tags t ON t.id = at.tag_id "
+                     f"WHERE at.asset_id = a.id AND t.name IN ({marks}))")
+        params.extend(exclude_tags)
+
+    return " AND ".join(where), params
+
+
 def search(
     *,
     q: str = "",
     media_type: Optional[str] = None,
     tag: Optional[str] = None,
+    include_tags=(),
+    exclude_tags=(),
     collection_id: Optional[int] = None,
     status: str = "active",
     sort: str = "newest",
     mode: str = "keyword",
-    limit: int = 60,
+    limit: int = DEFAULT_LIMIT,
     offset: int = 0,
 ) -> dict:
+    include = _tag_names(list(include_tags) + ([tag] if tag else []))
+    exclude = _tag_names(exclude_tags)
+
+    # Semantic mode ranks a candidate pool by embedding similarity. It reuses
+    # the structured filters but not the keyword condition, which it replaces.
+    if mode == "semantic" and q.strip():
+        where_sql, params = _where(q="", media_type=media_type, include_tags=include,
+                                   exclude_tags=exclude, collection_id=collection_id,
+                                   status=status)
+        return _semantic_search(q, where_sql, params, status, limit, offset)
+
+    where_sql, params = _where(q=q, media_type=media_type, include_tags=include,
+                               exclude_tags=exclude, collection_id=collection_id,
+                               status=status)
+    order = SORTS.get(sort, SORTS["newest"])
     conn = get_conn()
 
-    # Semantic mode ranks the candidate pool by embedding similarity.
-    if mode == "semantic" and q.strip():
-        return _semantic_search(q, media_type, status, limit, offset)
-
-    where = ["a.status = ?"]
-    params: list = [status]
-    join = ""
-
-    if q.strip():
-        join += " JOIN asset_fts f ON f.rowid = a.id"
-        where.append("asset_fts MATCH ?")
-        params.append(_fts_query(q))
-    if media_type:
-        where.append("a.media_type = ?")
-        params.append(media_type)
-    if tag:
-        join += (" JOIN asset_tags at ON at.asset_id = a.id"
-                 " JOIN tags t ON t.id = at.tag_id AND t.name = ?")
-        params.append(tag.lower())
-    if collection_id:
-        join += " JOIN collection_assets ca ON ca.asset_id = a.id AND ca.collection_id = ?"
-        params.append(collection_id)
-
-    where_sql = " AND ".join(where)
-    order = "bm25(asset_fts)" if q.strip() else SORTS.get(sort, SORTS["newest"])
-
     total = conn.execute(
-        f"SELECT COUNT(*) AS c FROM assets a{join} WHERE {where_sql}", params
+        f"SELECT COUNT(*) AS c FROM assets a WHERE {where_sql}", params
     ).fetchone()["c"]
 
     rows = conn.execute(
-        f"""SELECT a.* FROM assets a{join} WHERE {where_sql}
-            ORDER BY {order} LIMIT ? OFFSET ?""",
+        f"SELECT a.* FROM assets a WHERE {where_sql} ORDER BY {order} LIMIT ? OFFSET ?",
         [*params, limit, offset],
     ).fetchall()
 
@@ -85,19 +134,60 @@ def search(
         "items": [_card(dict(r)) for r in rows],
         "facets": _facets(status),
         "mode": mode,
+        "limit": limit,
+        "offset": offset,
+        "page": offset // limit + 1,
+        "pages": max(1, math.ceil(total / limit)),
     }
 
 
-def _semantic_search(q, media_type, status, limit, offset) -> dict:
+def export_rows(
+    *,
+    q: str = "",
+    media_type: Optional[str] = None,
+    include_tags=(),
+    exclude_tags=(),
+    collection_id: Optional[int] = None,
+    sort: str = "newest",
+) -> list[dict]:
+    """Every matching active asset in list order, plus its tag names.
+
+    Tags are collected in the same statement (a left join keeps the asset order
+    the list uses) and folded into one row per asset here.
+    """
+    where_sql, params = _where(q=q, media_type=media_type,
+                               include_tags=_tag_names(include_tags),
+                               exclude_tags=_tag_names(exclude_tags),
+                               collection_id=collection_id, status="active")
+    order = SORTS.get(sort, SORTS["newest"])
+
+    rows = get_conn().execute(
+        f"""SELECT a.uuid, a.title, a.description, a.filename, a.media_type,
+                   a.created_at, t.name AS tag
+            FROM assets a
+            LEFT JOIN asset_tags at ON at.asset_id = a.id
+            LEFT JOIN tags t ON t.id = at.tag_id
+            WHERE {where_sql}
+            ORDER BY {order}, t.name""",
+        params,
+    ).fetchall()
+
+    out: list[dict] = []
+    for row in rows:
+        if not out or out[-1]["uuid"] != row["uuid"]:
+            item = {field: row[field] for field in _EXPORT_FIELDS}
+            item["tags"] = []
+            out.append(item)
+        if row["tag"]:
+            out[-1]["tags"].append(row["tag"])
+    return out
+
+
+def _semantic_search(q, where_sql, params, status, limit, offset) -> dict:
     conn = get_conn()
     qvec = ai.embed(q)
-    where = ["status = ?", "embedding IS NOT NULL"]
-    params: list = [status]
-    if media_type:
-        where.append("media_type = ?")
-        params.append(media_type)
     rows = conn.execute(
-        f"SELECT * FROM assets WHERE {' AND '.join(where)}", params
+        f"SELECT a.* FROM assets a WHERE {where_sql} AND a.embedding IS NOT NULL", params
     ).fetchall()
     scored = []
     for r in rows:
@@ -110,7 +200,10 @@ def _semantic_search(q, media_type, status, limit, offset) -> dict:
         card = _card(dict(r))
         card["score"] = round(score, 4)
         items.append(card)
-    return {"total": len(scored), "items": items, "facets": _facets(status), "mode": "semantic"}
+    total = len(scored)
+    return {"total": total, "items": items, "facets": _facets(status), "mode": "semantic",
+            "limit": limit, "offset": offset, "page": offset // limit + 1,
+            "pages": max(1, math.ceil(total / limit))}
 
 
 def more_like(asset_id: int, limit: int = 12) -> list[dict]:
