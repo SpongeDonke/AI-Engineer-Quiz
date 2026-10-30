@@ -17,6 +17,10 @@ def main() -> None:
         from .seed import run_seed
         run_seed()
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "demo":
+        from .demo import run_demo
+        run_demo()
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "reindex":
         from . import vision
         from .db import get_conn, init_db
