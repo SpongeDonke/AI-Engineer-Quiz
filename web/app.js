@@ -9,7 +9,13 @@ const state = { token: localStorage.getItem("keepstack_token"), user: null,
 async function api(path, opts = {}) {
   const headers = opts.headers || {};
   if (state.token) headers["Authorization"] = "Bearer " + state.token;
-  if (opts.json) { headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(opts.json); }
+  if (opts.json) {
+    headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(opts.json);
+    // A JSON body means a write; without this fetch sends a GET, which the
+    // browser refuses to attach a body to, so every such call failed.
+    opts.method = opts.method || "POST";
+  }
   const res = await fetch(path, { ...opts, headers });
   if (res.status === 401) { logout(); throw new Error("unauthorised"); }
   if (!res.ok) { const t = await res.text(); throw new Error(t || res.statusText); }
@@ -30,7 +36,10 @@ $("#login-form").addEventListener("submit", async (e) => {
     const r = await api("/api/auth/login", { json: { username: $("#login-user").value, password: $("#login-pass").value } });
     state.token = r.token; localStorage.setItem("keepstack_token", r.token);
     state.user = r.user; enterApp();
-  } catch { $("#login-error").textContent = "Invalid credentials"; $("#login-error").classList.remove("hidden"); }
+  } catch (err) {
+    console.error(err);
+    $("#login-error").textContent = "Invalid credentials"; $("#login-error").classList.remove("hidden");
+  }
 });
 $("#btn-logout").addEventListener("click", logout);
 function logout() { localStorage.removeItem("keepstack_token"); state.token = null; state.user = null;

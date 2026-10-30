@@ -68,13 +68,19 @@ python -m keepstack
   非法 `limit`/`offset`、素材类型筛选同时作用于列表与导出、导出行与列表顺序一致、
   零结果仍输出表头、逗号 / 引号 / 换行 / 中文的 CSV 转义、登录鉴权、修改标题与标签后的查询
   与导出结果。
-- 浏览器走查（本地无头 Chrome 驱动真实页面）：默认 42 条 4 页；集合筛选 18 条 2 页；
-  `approved` → 17、`+campaign` → 16、`-internal` → 14；chip 删除单个条件后回到 16 并回到第一页；
-  Export 提示 `Exported 14 assets`；控制台无报错。
+- 浏览器走查（本地无头 Chrome 驱动真实页面）：`admin` / `admin` 登录 → 默认 42 条 4 页；
+  集合筛选 18 条 2 页；`approved` → 17、`+campaign` → 16、`-internal` → 14；chip 删除单个条件后
+  回到 16 并回到第一页；Export 提示 `Exported 14 assets`；建集合、加标签、创建分享链接
+  均成功并能读回；控制台无报错。
 - 导出文件：UTF-8（带 BOM，Excel 直接打开中文不乱码）、CRLF 换行；`Harbor at dawn` 的描述
   含逗号、引号和换行，导出后被正确加引号，用 `csv` 读回来与库中值逐字一致。
 
 ## 实现选择
+
+先修了一个挡路的既有缺陷：`web/app.js` 的 `api()` 对 `{ json: ... }` 只设了 Content-Type 和
+body，没有设 `method`，浏览器把它当成"带 body 的 GET"直接拒绝，于是登录、加标签、新建集合、
+分享链接全部失效（后端本身是好的）。改成有 json 时默认 `POST`，调用方显式传 `method` 的
+（PATCH / DELETE）不受影响。
 
 查询集中在 `keepstack/search.py`：
 
